@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-message-sender",
+  "version": "1.0.0",
+  "description": "Advanced WhatsApp Message Sender",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "npx puppeteer browsers install chrome"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.5.4",
+    "qrcode": "^1.5.3",
+    "whatsapp-web.js": "^1.23.0",
+    "puppeteer": "^21.0.0"
+  }
+}
