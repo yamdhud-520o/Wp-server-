@@ -1,409 +1,296 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server);
+const io = socketIo(server, {
+    cors: { origin: "*", methods: ["GET", "POST"] }
+});
 
+// ============ CONFIGURATION ============
 let client = null;
 let isConnected = false;
 let isSending = false;
 
-// Create sessions directory
-const sessionsDir = path.join(__dirname, 'sessions');
-if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir);
+// User Agent Headers
+const USER_AGENTS = {
+    chrome: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    firefox: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0',
+    edge: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0'
+};
 
-// Serve HTML directly from this file
-app.get('/', (req, res) => {
-    res.send(`
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WhatsApp Bulk Message Sender</title>
-    <script src="/socket.io/socket.io.js"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            min-height: 100vh;
-            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            padding: 20px;
-            position: relative;
+// Create directories
+const sessionsDir = path.join(__dirname, 'sessions');
+const logsDir = path.join(__dirname, 'logs');
+const dataDir = path.join(__dirname, 'data');
+
+if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir);
+if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir);
+if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir);
+
+// Stats file
+const statsFile = path.join(dataDir, 'stats.json');
+if (!fs.existsSync(statsFile)) {
+    fs.writeFileSync(statsFile, JSON.stringify({ totalSent: 0, startDate: new Date().toISOString(), history: [] }));
+}
+
+// ============ HELPER FUNCTIONS ============
+function saveStats(sent) {
+    try {
+        const stats = JSON.parse(fs.readFileSync(statsFile));
+        stats.totalSent += sent;
+        stats.history.push({ time: new Date().toISOString(), count: sent });
+        if (stats.history.length > 100) stats.history.shift();
+        fs.writeFileSync(statsFile, JSON.stringify(stats, null, 2));
+    } catch(e) {}
+}
+
+function logToFile(message, type = 'info') {
+    const logFile = path.join(logsDir, `${new Date().toISOString().split('T')[0]}.log`);
+    const logLine = `[${new Date().toISOString()}] [${type.toUpperCase()}] ${message}\n`;
+    fs.appendFileSync(logFile, logLine);
+}
+
+function addLog(message, type = 'info') {
+    const logData = { message, type, timestamp: new Date().toLocaleTimeString() };
+    io.emit('log', logData);
+    console.log(`[${type}] ${message}`);
+    logToFile(message, type);
+}
+
+// ============ WHATSAPP CLIENT INITIALIZATION ============
+function initializeClient() {
+    addLog('Initializing WhatsApp Client...', 'info');
+    
+    client = new Client({
+        authStrategy: new LocalAuth({ dataPath: sessionsDir }),
+        puppeteer: {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor',
+                '--disable-blink-features=AutomationControlled'
+            ]
+        },
+        userAgent: USER_AGENTS.chrome
+    });
+
+    client.on('qr', async (qr) => {
+        addLog('QR Code received! Scan with WhatsApp', 'warning');
+        try {
+            const qrImage = await QRCode.toDataURL(qr);
+            io.emit('qr', qrImage);
+        } catch (err) {
+            addLog('QR generation error: ' + err.message, 'error');
         }
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: radial-gradient(circle at 50% 50%, rgba(0,255,255,0.15) 0%, rgba(0,0,0,0.6) 100%);
-            backdrop-filter: blur(8px);
-            pointer-events: none;
-            z-index: 0;
-        }
-        .container {
-            max-width: 1600px;
-            margin: 0 auto;
-            position: relative;
-            z-index: 1;
-        }
-        .header {
-            text-align: center;
-            padding: 30px;
-            background: rgba(0, 0, 0, 0.6);
-            backdrop-filter: blur(20px);
-            border-radius: 20px;
-            margin-bottom: 30px;
-            border: 1px solid rgba(0, 255, 255, 0.3);
-            animation: glow 2s ease-in-out infinite alternate;
-        }
-        @keyframes glow {
-            from { box-shadow: 0 0 20px rgba(0, 255, 255, 0.2); }
-            to { box-shadow: 0 0 40px rgba(0, 255, 255, 0.5); }
-        }
-        .header h1 {
-            color: #00ffff;
-            font-size: 2.5em;
-            text-shadow: 0 0 15px rgba(0, 255, 255, 0.8);
-        }
-        .status-bar {
-            display: inline-block;
-            margin-left: 20px;
-            padding: 5px 15px;
-            background: rgba(0,0,0,0.5);
-            border-radius: 20px;
-            font-size: 14px;
-        }
-        .status-connected { color: #00ff00; }
-        .status-disconnected { color: #ff0000; }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
-            gap: 25px;
-            margin-bottom: 25px;
-        }
-        .card {
-            background: rgba(0, 0, 0, 0.7);
-            backdrop-filter: blur(15px);
-            border-radius: 20px;
-            padding: 25px;
-            border: 1px solid rgba(0, 255, 255, 0.2);
-            transition: all 0.3s ease;
-        }
-        .card:hover {
-            border-color: rgba(0, 255, 255, 0.6);
-            box-shadow: 0 0 30px rgba(0, 255, 255, 0.3);
-        }
-        .card-title {
-            color: #00ffff;
-            font-size: 1.5em;
-            margin-bottom: 20px;
-            border-bottom: 2px solid rgba(0, 255, 255, 0.3);
-            padding-bottom: 10px;
-        }
-        .input-group { margin-bottom: 18px; }
-        label {
-            display: block;
-            color: #fff;
-            margin-bottom: 8px;
-            font-size: 0.95em;
-            font-weight: 500;
-        }
-        input, textarea, select {
-            width: 100%;
-            padding: 12px;
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(0, 255, 255, 0.3);
-            border-radius: 10px;
-            color: #fff;
-            font-size: 14px;
-        }
-        input:focus, textarea:focus {
-            outline: none;
-            border-color: #00ffff;
-            background: rgba(255, 255, 255, 0.2);
-        }
-        button {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 12px 25px;
-            border: none;
-            border-radius: 10px;
-            cursor: pointer;
-            font-size: 15px;
-            font-weight: bold;
-            margin-right: 10px;
-            margin-top: 10px;
-            transition: all 0.3s ease;
-        }
-        button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(0, 255, 255, 0.4);
-        }
-        button.danger { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
-        button.success { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }
-        .console {
-            background: rgba(0, 0, 0, 0.85);
-            border-radius: 20px;
-            padding: 20px;
-            margin-top: 25px;
-        }
-        .console-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-        }
-        .console-title { color: #00ffff; font-size: 1.3em; font-weight: bold; }
-        .console-logs {
-            background: rgba(0, 0, 0, 0.5);
-            height: 300px;
-            overflow-y: auto;
-            padding: 15px;
-            border-radius: 10px;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-        }
-        .log-entry { padding: 5px; margin: 5px 0; border-left: 3px solid #00ffff; color: #0f0; }
-        .log-error { border-left-color: #ff0000; color: #ff6666; }
-        .log-success { border-left-color: #00ff00; color: #00ff00; }
-        .log-warning { border-left-color: #ffff00; color: #ffff00; }
-        .qr-container { text-align: center; margin-top: 15px; }
-        .qr-container img { max-width: 200px; border-radius: 10px; }
-        .progress-bar {
-            width: 100%;
-            height: 30px;
-            background: rgba(255,255,255,0.1);
-            border-radius: 15px;
-            overflow: hidden;
-            margin-top: 10px;
-        }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #00ffff, #4facfe);
-            transition: width 0.3s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-size: 12px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🚀 WhatsApp Bulk Message Sender <span id="statusIndicator" class="status-bar status-disconnected">● Disconnected</span></h1>
-            <p>Advanced Messaging System with Multi-Device Support</p>
-        </div>
-        <div class="grid">
-            <div class="card">
-                <div class="card-title">📱 STEP 1: DEVICE PAIRING</div>
-                <div class="input-group">
-                    <label>📞 Your Number (with country code)</label>
-                    <input type="text" id="userNumber" placeholder="923001234567">
-                </div>
-                <button class="success" onclick="getPairingCode()">🔐 GET PAIRING CODE</button>
-                <button class="success" onclick="connectDevice()">🔗 CONNECT DEVICE</button>
-                <div id="qrContainer" class="qr-container"></div>
-                <div id="pairingCodeDisplay" style="margin-top: 10px; color: #00ff00; font-weight: bold;"></div>
-            </div>
-            <div class="card">
-                <div class="card-title">📤 STEP 2: SEND MESSAGES</div>
-                <div class="input-group">
-                    <label>🎯 Target Type</label>
-                    <select id="targetType">
-                        <option value="number">Phone Number</option>
-                        <option value="group">Group ID</option>
-                    </select>
-                </div>
-                <div class="input-group">
-                    <label>📞 Target Number(s) / Group ID</label>
-                    <textarea id="targets" rows="3" placeholder="923001234567&#10;923009876543"></textarea>
-                    <input type="text" id="groupId" placeholder="Or Group ID" style="display:none;">
-                </div>
-                <div class="input-group">
-                    <label>📄 Message Prefix</label>
-                    <input type="text" id="messagePrefix" placeholder="Hello">
-                </div>
-                <div class="input-group">
-                    <label>💬 Message Content</label>
-                    <textarea id="messageText" rows="3" placeholder="Your message here..."></textarea>
-                </div>
-                <div class="input-group">
-                    <label>⏱️ Delay (seconds)</label>
-                    <input type="number" id="delay" value="2" min="1">
-                </div>
-                <div class="input-group">
-                    <label>🔄 Cycles (-1 = Infinite)</label>
-                    <input type="number" id="cycles" value="1" min="-1">
-                </div>
-                <button class="success" onclick="startSending()">▶ START SENDING</button>
-                <button class="danger" onclick="stopSending()">⏹️ STOP SENDING</button>
-                <div id="progressContainer" style="display:none;">
-                    <div class="progress-bar"><div class="progress-fill" id="progressFill">0%</div></div>
-                    <p id="progressText" style="color:white; margin-top:10px;"></p>
-                </div>
-            </div>
-            <div class="card">
-                <div class="card-title">⚙️ STEP 3: SESSION CONTROL</div>
-                <button onclick="viewSession()">👁️ VIEW SESSION</button>
-                <button onclick="getGroups()">👥 GET GROUPS</button>
-                <button class="danger" onclick="stopSession()">🛑 STOP SESSION</button>
-                <div id="groupsList" style="margin-top: 15px; max-height: 200px; overflow-y: auto;"></div>
-            </div>
-        </div>
-        <div class="console">
-            <div class="console-header">
-                <div class="console-title">📋 LIVE CONSOLE LOGS</div>
-                <button onclick="clearLogs()">🗑️ CLEAR LOGS</button>
-            </div>
-            <div class="console-logs" id="consoleLogs"></div>
-        </div>
-    </div>
-    <script>
-        const socket = io();
-        function addLog(message, type) {
-            const logsDiv = document.getElementById('consoleLogs');
-            const logEntry = document.createElement('div');
-            logEntry.className = 'log-entry log-' + (type || 'info');
-            logEntry.innerHTML = '[' + new Date().toLocaleTimeString() + '] ' + message;
-            logsDiv.appendChild(logEntry);
-            logsDiv.scrollTop = logsDiv.scrollHeight;
-        }
-        function clearLogs() { document.getElementById('consoleLogs').innerHTML = ''; addLog('Console cleared', 'info'); }
-        socket.on('log', (data) => { addLog(data.message, data.type); });
-        socket.on('qr', (qrData) => {
-            document.getElementById('qrContainer').innerHTML = '<img src="' + qrData + '" alt="QR Code"><p style="color:white; margin-top:10px;">Scan QR code with WhatsApp</p>';
-            addLog('QR Code generated - Scan to connect', 'warning');
-        });
-        socket.on('connected', (status) => {
-            const indicator = document.getElementById('statusIndicator');
-            if(status) {
-                indicator.innerHTML = '● Connected';
-                indicator.className = 'status-bar status-connected';
-                addLog('WhatsApp connected successfully!', 'success');
-            } else {
-                indicator.innerHTML = '● Disconnected';
-                indicator.className = 'status-bar status-disconnected';
-                addLog('WhatsApp disconnected', 'error');
+    });
+
+    client.on('ready', () => {
+        isConnected = true;
+        addLog('✅ WhatsApp Client Ready!', 'success');
+        io.emit('connected', true);
+        sendStartupNotification();
+    });
+
+    client.on('authenticated', () => {
+        addLog('✅ Authentication successful!', 'success');
+    });
+
+    client.on('auth_failure', (msg) => {
+        isConnected = false;
+        addLog('❌ Auth failed: ' + msg, 'error');
+        io.emit('connected', false);
+    });
+
+    client.on('disconnected', (reason) => {
+        isConnected = false;
+        addLog('❌ Disconnected: ' + reason, 'error');
+        io.emit('connected', false);
+        setTimeout(() => {
+            if (!isConnected) {
+                addLog('Reconnecting...', 'warning');
+                client.initialize();
             }
-        });
-        socket.on('pairingCode', (code) => {
-            document.getElementById('pairingCodeDisplay').innerHTML = 'Pairing Code: ' + code + '<br>Use this code in WhatsApp linked devices';
-            addLog('Pairing code received: ' + code, 'success');
-        });
-        socket.on('groups', (groups) => {
-            const groupsDiv = document.getElementById('groupsList');
-            groupsDiv.innerHTML = '<h4 style="color:#00ffff;">Your Groups:</h4>';
-            groups.forEach(group => {
-                groupsDiv.innerHTML += '<div style="color:white; padding:5px; border-bottom:1px solid rgba(0,255,255,0.3);"><strong>' + group.name + '</strong><br>ID: ' + group.id + '<br>Members: ' + group.participantCount + '</div>';
-            });
-            addLog('Loaded ' + groups.length + ' groups', 'success');
-        });
-        socket.on('progress', (data) => {
-            const percent = Math.round((data.current / data.total) * 100);
-            document.getElementById('progressFill').style.width = percent + '%';
-            document.getElementById('progressFill').innerHTML = percent + '%';
-            document.getElementById('progressText').innerHTML = 'Sent: ' + data.sent + ' messages | Progress: ' + data.current + '/' + data.total;
-        });
-        socket.on('completed', (data) => {
-            document.getElementById('progressContainer').style.display = 'none';
-            addLog('Sending completed! Total sent: ' + data.totalSent + ' messages in ' + data.cycles + ' cycles', 'success');
-        });
-        function getPairingCode() {
-            const number = document.getElementById('userNumber').value;
-            if(!number) { addLog('Please enter your number', 'error'); return; }
-            socket.emit('getPairingCode', number);
-            addLog('Requesting pairing code for ' + number + '...', 'info');
+        }, 5000);
+    });
+
+    client.on('message', async (message) => {
+        addLog(`📩 New message from ${message.from}: ${message.body.substring(0, 50)}`, 'info');
+        // Auto-reply feature (optional)
+        if (message.body.toLowerCase() === '!ping') {
+            await message.reply('pong! 🏓');
         }
-        function connectDevice() { socket.emit('connectDevice'); addLog('Connecting device...', 'info'); }
-        function getGroups() { socket.emit('getGroups'); addLog('Fetching groups...', 'info'); }
-        function viewSession() { addLog('Session active: ' + (document.getElementById('statusIndicator').innerHTML.includes('Connected') ? 'Connected' : 'Disconnected'), 'info'); }
-        function stopSession() { socket.emit('stopSending'); addLog('Session stopped by user', 'warning'); }
-        function startSending() {
-            const targetType = document.getElementById('targetType').value;
-            const targets = document.getElementById('targets').value;
-            const groupId = document.getElementById('groupId').value;
-            const messagePrefix = document.getElementById('messagePrefix').value;
-            const messageText = document.getElementById('messageText').value;
-            const delay = parseInt(document.getElementById('delay').value);
-            const cycles = parseInt(document.getElementById('cycles').value);
-            if(!messageText) { addLog('Please enter a message', 'error'); return; }
-            const fullMessage = messagePrefix ? messagePrefix + '\\n' + messageText : messageText;
-            const data = { targetType, targets: targetType === 'number' ? targets : '', groupId: targetType === 'group' ? groupId : '', messageText: fullMessage, delay, cycles };
-            document.getElementById('progressContainer').style.display = 'block';
-            socket.emit('startSending', data);
-            addLog('Starting message sending...', 'success');
+    });
+
+    return client;
+}
+
+async function sendStartupNotification() {
+    try {
+        const adminNumber = process.env.ADMIN_NUMBER || '';
+        if (adminNumber) {
+            await client.sendMessage(`${adminNumber}@c.us`, '🤖 WhatsApp Bot is now online and ready!');
         }
-        function stopSending() { socket.emit('stopSending'); addLog('Stopping message sending...', 'warning'); }
-        document.getElementById('targetType').addEventListener('change', function() {
-            const isGroup = this.value === 'group';
-            document.getElementById('targets').style.display = isGroup ? 'none' : 'block';
-            document.getElementById('groupId').style.display = isGroup ? 'block' : 'none';
-        });
-    </script>
-</body>
-</html>
-    `);
+    } catch(e) {}
+}
+
+// ============ API ENDPOINTS (Graph API Style) ============
+app.use(express.json());
+
+// Status API
+app.get('/api/v1/status', (req, res) => {
+    res.json({
+        status: isConnected ? 'connected' : 'disconnected',
+        sending: isSending,
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString()
+    });
 });
 
-// Socket.IO events
+// Stats API
+app.get('/api/v1/stats', (req, res) => {
+    const stats = JSON.parse(fs.readFileSync(statsFile));
+    res.json(stats);
+});
+
+// Groups API
+app.get('/api/v1/groups', async (req, res) => {
+    if (!client || !isConnected) {
+        return res.status(503).json({ error: 'WhatsApp not connected', groups: [] });
+    }
+    try {
+        const chats = await client.getChats();
+        const groups = chats.filter(chat => chat.isGroup).map(g => ({
+            id: g.id._serialized,
+            name: g.name,
+            members: g.participants.length,
+            createdAt: g.createdAt
+        }));
+        res.json({ success: true, count: groups.length, groups });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Send Message API
+app.post('/api/v1/send', async (req, res) => {
+    const { to, message, delay } = req.body;
+    
+    if (!client || !isConnected) {
+        return res.status(503).json({ error: 'WhatsApp not connected' });
+    }
+    
+    if (!to || !message) {
+        return res.status(400).json({ error: 'Missing "to" or "message" field' });
+    }
+    
+    try {
+        if (delay) await new Promise(r => setTimeout(r, delay * 1000));
+        
+        let chatId = to.includes('@') ? to : `${to}@c.us`;
+        const result = await client.sendMessage(chatId, message);
+        
+        res.json({ success: true, messageId: result.id.id, to: chatId });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Bulk Send API
+app.post('/api/v1/bulk-send', async (req, res) => {
+    const { targets, message, delay, cycles } = req.body;
+    
+    if (!client || !isConnected) {
+        return res.status(503).json({ error: 'WhatsApp not connected' });
+    }
+    
+    let targetsList = Array.isArray(targets) ? targets : [targets];
+    let totalSent = 0;
+    
+    res.json({ success: true, message: 'Bulk send started', totalTargets: targetsList.length });
+    
+    // Process in background
+    (async () => {
+        for (let cycle = 0; cycle < (cycles || 1); cycle++) {
+            for (const target of targetsList) {
+                if (!target.trim()) continue;
+                try {
+                    let chatId = target.includes('@') ? target : `${target}@c.us`;
+                    await client.sendMessage(chatId, message);
+                    totalSent++;
+                    addLog(`Bulk: Sent to ${target}`, 'success');
+                    if (delay) await new Promise(r => setTimeout(r, delay * 1000));
+                } catch(e) {
+                    addLog(`Bulk failed: ${target} - ${e.message}`, 'error');
+                }
+            }
+        }
+        addLog(`Bulk send completed! Total sent: ${totalSent}`, 'success');
+        saveStats(totalSent);
+    })();
+});
+
+// Get chats API
+app.get('/api/v1/chats', async (req, res) => {
+    if (!client || !isConnected) {
+        return res.status(503).json({ error: 'WhatsApp not connected' });
+    }
+    try {
+        const chats = await client.getChats();
+        const simplified = chats.slice(0, 50).map(c => ({
+            id: c.id._serialized,
+            name: c.name || c.id.user,
+            isGroup: c.isGroup,
+            unreadCount: c.unreadCount
+        }));
+        res.json({ success: true, chats: simplified });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Serve main page
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+// ============ SOCKET.IO EVENTS ============
 io.on('connection', (socket) => {
-    console.log('Client connected');
+    addLog(`New client connected: ${socket.id}`, 'info');
     
     socket.on('getPairingCode', async (number) => {
         try {
             if (!client) {
-                client = new Client({
-                    authStrategy: new LocalAuth({ dataPath: sessionsDir }),
-                    puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
-                });
+                initializeClient();
                 await client.initialize();
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                await new Promise(r => setTimeout(r, 3000));
             }
             const code = await client.requestPairingCode(number);
             io.emit('pairingCode', code);
-            addLog(`Pairing code for ${number}: ${code}`);
+            addLog(`Pairing code for ${number}: ${code}`, 'success');
         } catch (error) {
-            addLog(`Error: ${error.message}`, 'error');
+            addLog(`Pairing error: ${error.message}`, 'error');
+            socket.emit('error', error.message);
         }
     });
     
     socket.on('connectDevice', async () => {
         try {
             if (!client) {
-                client = new Client({
-                    authStrategy: new LocalAuth({ dataPath: sessionsDir }),
-                    puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
-                });
-                
-                client.on('qr', async (qr) => {
-                    const qrImage = await QRCode.toDataURL(qr);
-                    io.emit('qr', qrImage);
-                    addLog('QR Code generated', 'warning');
-                });
-                
-                client.on('ready', () => {
-                    isConnected = true;
-                    io.emit('connected', true);
-                    addLog('WhatsApp Client Ready!', 'success');
-                });
-                
-                client.on('disconnected', () => {
-                    isConnected = false;
-                    io.emit('connected', false);
-                    addLog('Client disconnected', 'error');
-                });
-                
+                initializeClient();
                 await client.initialize();
             }
             addLog('Device connection initiated', 'info');
@@ -415,7 +302,7 @@ io.on('connection', (socket) => {
     socket.on('getGroups', async () => {
         try {
             if (!client || !isConnected) {
-                addLog('Client not connected', 'error');
+                addLog('Not connected! First connect WhatsApp', 'error');
                 return;
             }
             const chats = await client.getChats();
@@ -427,95 +314,78 @@ io.on('connection', (socket) => {
             io.emit('groups', groups);
             addLog(`Found ${groups.length} groups`, 'success');
         } catch (error) {
-            addLog(`Error: ${error.message}`, 'error');
+            addLog(`Groups error: ${error.message}`, 'error');
         }
     });
     
     socket.on('startSending', async (data) => {
         if (isSending) {
-            addLog('Already sending messages!', 'warning');
+            addLog('Already sending! Wait or stop first', 'warning');
             return;
         }
+        
         isSending = true;
-        try {
-            let targets = data.targetType === 'number' ? data.targets.split('\\n').filter(t => t.trim()) : [data.groupId];
-            let totalSent = 0;
-            let cycleCount = 0;
-            let cycles = data.cycles;
+        let targets = data.targetType === 'number' ? data.targets.split('\n').filter(t => t.trim()) : [data.groupId];
+        let totalSent = 0;
+        let cycleCount = 0;
+        let cycles = data.cycles;
+        
+        addLog(`Started sending to ${targets.length} targets`, 'success');
+        
+        while (cycles === -1 || cycleCount < cycles) {
+            if (!isSending) break;
+            cycleCount++;
+            addLog(`Cycle ${cycleCount} of ${cycles === -1 ? '∞' : cycles}`, 'info');
             
-            while (cycles === -1 || cycleCount < cycles) {
+            for (let i = 0; i < targets.length; i++) {
                 if (!isSending) break;
-                cycleCount++;
-                addLog(`Starting cycle ${cycleCount}`, 'info');
-                
-                for (let i = 0; i < targets.length; i++) {
-                    if (!isSending) break;
-                    const target = targets[i].trim();
-                    if (target) {
-                        await new Promise(resolve => setTimeout(resolve, data.delay * 1000));
-                        try {
-                            let chatId = target.includes('@') ? target : `${target}@c.us`;
-                            await client.sendMessage(chatId, data.messageText);
-                            totalSent++;
-                            addLog(`✅ Sent to ${target}`, 'success');
-                            socket.emit('progress', { current: i + 1, total: targets.length, sent: totalSent });
-                        } catch (err) {
-                            addLog(`❌ Failed to send to ${target}: ${err.message}`, 'error');
-                        }
+                const target = targets[i].trim();
+                if (target) {
+                    try {
+                        await new Promise(r => setTimeout(r, data.delay * 1000));
+                        let chatId = target.includes('@') ? target : `${target}@c.us`;
+                        await client.sendMessage(chatId, data.messageText);
+                        totalSent++;
+                        addLog(`✅ Sent to ${target}`, 'success');
+                        socket.emit('progress', { current: i + 1, total: targets.length, sent: totalSent });
+                    } catch (err) {
+                        addLog(`❌ Failed to ${target}: ${err.message}`, 'error');
                     }
                 }
             }
-            io.emit('completed', { totalSent, cycles: cycleCount });
-            addLog(`Completed! Sent ${totalSent} messages`, 'success');
-        } catch (error) {
-            addLog(`Error: ${error.message}`, 'error');
-        } finally {
-            isSending = false;
         }
+        
+        io.emit('completed', { totalSent, cycles: cycleCount });
+        addLog(`✅ Completed! Total sent: ${totalSent} messages`, 'success');
+        saveStats(totalSent);
+        isSending = false;
     });
     
     socket.on('stopSending', () => {
         isSending = false;
-        addLog('Stopping message sending...', 'warning');
+        addLog('⏹️ Stopped by user', 'warning');
+    });
+    
+    socket.on('disconnect', () => {
+        addLog(`Client disconnected: ${socket.id}`, 'info');
     });
 });
 
-function addLog(message, type = 'info') {
-    io.emit('log', { message, type });
-    console.log(`[${type}] ${message}`);
-}
-
-// Start server
+// ============ START SERVER ============
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    addLog(`Server started on port ${PORT}`, 'success');
+    addLog(`🚀 Server running on port ${PORT}`, 'success');
+    console.log(`\n📱 Open: http://localhost:${PORT}`);
+    console.log(`🌐 API: http://localhost:${PORT}/api/v1/status\n`);
 });
 
-// Initialize client on startup
-(async () => {
-    client = new Client({
-        authStrategy: new LocalAuth({ dataPath: sessionsDir }),
-        puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
-    });
-    
-    client.on('qr', async (qr) => {
-        const qrImage = await QRCode.toDataURL(qr);
-        io.emit('qr', qrImage);
-        addLog('QR Code generated - Scan to connect', 'warning');
-    });
-    
-    client.on('ready', () => {
-        isConnected = true;
-        io.emit('connected', true);
-        addLog('✅ WhatsApp Client Ready!', 'success');
-    });
-    
-    client.on('disconnected', () => {
-        isConnected = false;
-        io.emit('connected', false);
-        addLog('❌ Client disconnected', 'error');
-    });
-    
-    await client.initialize();
-})();
+// Auto-start WhatsApp client
+initializeClient();
+client.initialize();
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+    addLog('Shutting down...', 'warning');
+    if (client) await client.destroy();
+    process.exit(0);
+});
