@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-message-sender",
   "version": "1.0.0",
-  "description": "Advanced WhatsApp Message Sender",
+  "description": "Complete WhatsApp Bulk Message Sender with API",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -12,6 +12,9 @@
     "socket.io": "^4.5.4",
     "qrcode": "^1.5.3",
     "whatsapp-web.js": "^1.23.0",
-    "puppeteer": "^21.0.0"
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
